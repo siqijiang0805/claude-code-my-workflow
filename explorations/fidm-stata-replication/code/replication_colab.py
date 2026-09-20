@@ -82,7 +82,19 @@ def stata_lag(df, cols, by="gvkey", t="year", n=1):
 
 
 def outreg2_like(models, ctitles, path):
-    """复刻 outreg2 ..., excel dec(3) addtext(Firm FE, YES, Year FE, YES)"""
+    """复刻 outreg2 ..., excel dec(3) addtext(Firm FE, YES, Year FE, YES)
+
+    行顺序：把各模型的变量序列归并，让只出现在某一列的变量（比如 interaction）
+    落在它在该模型里的位置，而不是被甩到表格最末尾。"""
+    order = []
+    for m in sorted(models, key=lambda m: -len(m.tidy().index)):
+        idx = list(m.tidy().index)
+        for j, v in enumerate(idx):
+            if v in order:
+                continue
+            prev = [u for u in idx[:j] if u in order]
+            order.insert(order.index(prev[-1]) + 1 if prev else 0, v)
+
     cols = {}
     for m, ct in zip(models, ctitles):
         t = m.tidy()                                      # pyfixest 的系数表
@@ -97,7 +109,9 @@ def outreg2_like(models, ctitles, path):
         col["Firm FE"]      = "YES"
         col["Year FE"]      = "YES"
         cols[ct] = col
-    out = pd.DataFrame(cols)
+    rows = [x for v in order for x in (v, v + "_se")]
+    rows += ["Observations", "R-squared", "Firm FE", "Year FE"]
+    out = pd.DataFrame(cols).reindex(rows).fillna("")
     out.to_excel(path)
     return out
 
