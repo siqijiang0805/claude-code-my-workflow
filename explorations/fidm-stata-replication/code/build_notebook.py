@@ -130,7 +130,19 @@ def _attr(m, *names):
 
 
 def outreg2_like(models, ctitles, path):
-    """复刻 outreg2 ..., excel dec(3) addtext(Firm FE, YES, Year FE, YES)"""
+    """复刻 outreg2 ..., excel dec(3) addtext(Firm FE, YES, Year FE, YES)
+
+    行顺序：把各模型的变量序列归并，让只出现在某一列的变量（比如
+    interaction）落在它在该模型里的位置，而不是被甩到表格最末尾。"""
+    order = []
+    for m in sorted(models, key=lambda m: -len(m.tidy().index)):
+        idx = list(m.tidy().index)
+        for j, v in enumerate(idx):
+            if v in order:
+                continue
+            prev = [u for u in idx[:j] if u in order]
+            order.insert(order.index(prev[-1]) + 1 if prev else 0, v)
+
     cols = {}
     for m, ct in zip(models, ctitles):
         t = m.tidy()
@@ -149,7 +161,9 @@ def outreg2_like(models, ctitles, path):
         col["Firm FE"]      = "YES"
         col["Year FE"]      = "YES"
         cols[ct] = col
-    out = pd.DataFrame(cols)
+    rows = [x for v in order for x in (v, v + "_se")]
+    rows += ["Observations", "R-squared", "Firm FE", "Year FE"]
+    out = pd.DataFrame(cols).reindex(rows).fillna("")
     out.to_excel(path)
     print("saved:", path)
     return out
@@ -602,6 +616,40 @@ df = df.drop(columns="_merge")
 ''')
 
 # ----------------------------------------------------------------- 5a
+md(r"""## §4.5　样本流失诊断（可选，不改变任何结果）
+
+do 文件里没有这一段，**它只打印、不改数据**，跑不跑都不影响回归结果。
+
+作业模板表里 N = 8,263。如果你的 N 明显偏小，就用这一格定位是哪个变量把样本吃掉了：
+回归是 listwise 剔除，**任何一个变量缺失，整行就没了**。
+
+常见的三个元凶：
+- `tenure_ceo` —— `becameceo` 日期解析失败（§3.4 会打印失败行数）
+- `Volatility` —— `BS_VOLATILITY` 在 Execucomp 里本身就缺得多
+- `lag_zROA` / `lag_zRstock` —— 需要连续年份，一家公司至少要有 3 个连续年度才能贡献一行
+""")
+code(r'''
+REG = ["ln_tdc", "powerindex", "zROA", "zRstock", "lag_zROA", "lag_zRstock",
+       "LnAsset", "Volatility", "sharesowned", "sharesowned2", "optionsvalue",
+       "tenure_ceo", "tenure_ceo2"]
+
+print("合并后总行数:", len(df))
+print("\n各变量的非缺失行数：")
+cnt = df[REG].notna().sum().sort_values()
+print(cnt.to_string())
+
+print("\n累计剔除（从最稀缺的变量开始逐个叠加）：")
+keep = pd.Series(True, index=df.index)
+for c in cnt.index:
+    before = keep.sum()
+    keep &= df[c].notna()
+    print(f"  + {c:15s} {before:6d} -> {keep.sum():6d}   (少了 {before - keep.sum()})")
+
+print("\n最终回归样本的年份分布：")
+print(df.loc[keep, "year"].value_counts().sort_index().to_string())
+print("\n最终样本公司数:", df.loc[keep, "gvkey"].nunique())
+''')
+
 md(r"""## §5-a　第 (1) 列：Level effect
 ### Morse et al. (2011) Table II column (1)
 
