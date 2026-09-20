@@ -2,430 +2,266 @@
 * FIDM 2023-2024  --  REPLICATION ASSIGNMENT
 *
 * Purpose : Replicate the level effect (Morse, Nanda & Seru 2011, Table II col 1)
-*           and the rigging effect (Table III col 3), and run the climate-change
-*           extension.
-* Input   : data/execucomp_executive.dta      (Execucomp Annual Compensation, 1992-2005)
-*           data/execucomp_perforamance.dta   (Execucomp Company Financial, 1992-2005)
-*                                             [spelling as required by the instruction]
-*           data/firmyear_score_2021Q4_Version_2022_Nov_22.csv   (OSF, Sautner et al. 2023)
+*           and the rigging effect (Table III col 3), plus the climate-change
+*           extension (Sautner et al. 2023).
+*
+* Input   : data/execucomp_executive.dta       Execucomp Annual Compensation, 1992-2005
+*           data/execucomp_perforamance.dta    Execucomp Company Financial, 1992-2005
+*                                              [spelling as required by the instruction]
+*           data/climatechage_exposure.csv     OSF firmyear_score_2021Q4_..., renamed
 * Output  : data/execucomp_morse.dta
 *           data/extension_exercise.dta
-*           result/table_main.rtf
-*           result/table_extension.rtf
+*           results/table1.xls, results/table2.xls
+*
+* All variable definitions follow the official solution
+* (code/official_solution.do). Lines marked [SUBMISSION FIX] are additions the
+* assignment text requires but the official solution omits; lines marked
+* [DISCUSS] are judgement calls to write up in the 2-page PDF.
+*
 * Authors : [GROUP MEMBER NAMES]
 * Date    : [DATE]
 *===============================================================================
 
-*-------------------------------------------------------------------------------
-* 0. SET-UP
-*-------------------------------------------------------------------------------
 clear all
 set more off
-version 17                      // adapt to your Stata version
 
-* --- working directory: the ONLY machine-specific line in this do file ---------
-cd "[YOUR PATH]/Stata workshop"          // Windows: cd "C:\Users\...\Stata workshop"
+*-------------------------------------------------------------------------------
+* 0) Working directory -- the ONLY machine-specific line in this do file
+*-------------------------------------------------------------------------------
+cd "[YOUR PATH]/Replication_Assignment"
+* Windows: cd "C:\Users\...\Replication_Assignment"
+* Mac    : cd "/Users/.../Replication_Assignment"      and use "/" in all paths below
 
-capture mkdir "result"
-capture mkdir "temp"
+capture mkdir "results"        // outreg2 errors out if this folder does not exist
 
-* --- packages (workshop Exercise: ssc install) ---------------------------------
-capture which winsor2   | ssc install winsor2, replace
-capture which outreg2   | ssc install outreg2, replace
-capture which unique    | ssc install unique, replace
-capture which reghdfe   | ssc install reghdfe, replace
-capture which ftools    | ssc install ftools, replace   // reghdfe dependency
-
-* --- log -----------------------------------------------------------------------
-capture log close
-log using "result/replication_log.smcl", replace
+* Packages used: winsor2 is NOT needed (the solution does not winsorize).
+capture which reghdfe  | ssc install reghdfe, replace
+capture which ftools   | ssc install ftools,  replace
+capture which outreg2  | ssc install outreg2, replace
 
 
 *===============================================================================
-* 1. CLEAN THE EXECUTIVE FILE  (execucomp_executive.dta)
-*    Level = executive-year.  Goal: one row per CEO-firm-year.
+* 1-2) COMPANY FINANCIAL FILE
+*
+* Done FIRST and on the FULL firm-year panel, before any CEO filter and before
+* the merge. That matters: the industry-year benchmark for the z-scores is all
+* Execucomp firms in that sic2-year, and the lags can reach back into firm-years
+* that never enter the regression sample.
+*===============================================================================
+use "data/execucomp_perforamance.dta", clear
+
+*--- 2.1) WRDS ships the .dta with UPPERCASE names; standardise them ------------
+rename GVKEY         gvkey
+rename ASSETS        assets
+rename PRCCF         prccf
+rename YEAR          year
+rename BS_VOLATILITY bs_volatility
+rename SIC           sic
+rename AJEX          ajex
+* NOTE: ROA is deliberately left uppercase and used as ROA throughout.
+
+*--- 2.2) panel set-up -----------------------------------------------------------
+duplicates list gvkey year        // inspect only; the file should already be unique
+destring gvkey, replace           // "001004" (string, leading zeros) -> 1004 (numeric)
+xtset gvkey year
+
+*--- 2.3) firm-level variables ----------------------------------------------------
+gen LnAsset = log(assets)
+rename bs_volatility Volatility
+
+* Annual stock return. PRCCF is the RAW fiscal-year-end close, which jumps on
+* splits; AJEX is the cumulative adjustment factor, so PRCCF/AJEX is comparable
+* across years. [DISCUSS] This is a PRICE return: it excludes dividends, because
+* the instruction did not ask for TRS1YR.
+gen Rstock = (prccf/ajex)/(l.prccf/l.ajex) - 1
+
+* 2-digit SIC industry
+tostring sic, replace
+replace sic = "0" + sic if strlen(sic) == 3     // pad 3-digit codes to 4
+gen sic2 = substr(sic,1,2)
+
+* --- STANDARDISED PERFORMANCE: benchmark group is sic2 x year -------------------
+sort sic2 year
+by sic2 year: egen mean_sic2_year_ROA    = mean(ROA)
+by sic2 year: egen std_sic2_year_ROA     = sd(ROA)
+by sic2 year: egen mean_sic2_year_Rstock = mean(Rstock)
+by sic2 year: egen std_sic2_year_Rstock  = sd(Rstock)
+
+gen zROA    = (ROA    - mean_sic2_year_ROA)    / std_sic2_year_ROA
+gen zRstock = (Rstock - mean_sic2_year_Rstock) / std_sic2_year_Rstock
+
+label variable zROA    "Standardised ROA (sic2-year)"
+label variable zRstock "Standardised stock return (sic2-year)"
+
+xtset gvkey year
+gen lag_zROA    = l.zROA
+gen lag_zRstock = l.zRstock
+
+save "data/execucomp_perforamance1.dta", replace
+clear all
+
+
+*===============================================================================
+* 3) EXECUTIVE FILE
 *===============================================================================
 use "data/execucomp_executive.dta", clear
 
-describe                         // ALWAYS look at types first (string vs numeric)
-codebook gvkey year ceoann, compact
+*-------------------------------------------------------------------------------
+* 3.1) POWER INDEX -- an ordinal 0/1/2 title-concentration measure
+*      0 = CEO only
+*      1 = CEO who is also chairman
+*      2 = CEO who is also chairman AND president
+*      Note: president WITHOUT chairman stays at 0 (the second replace requires
+*      the chairman condition as well).
+*      Tenure and ownership are NOT components -- they are controls only.
+*-------------------------------------------------------------------------------
+gen lower_title = lower(TITLE)
 
-* --- 1.1 keep CEOs only --------------------------------------------------------
-* CEOANN == "CEO" flags the person who was CEO at fiscal year end.
-tab ceoann, missing
+gen powerindex = 0
+replace powerindex = 1 if strpos(lower_title,"chairman")    > 0 ///
+                        | strpos(lower_title,"chairwoman")  > 0 ///
+                        | strpos(lower_title,"chairperson") > 0
+
+replace powerindex = 2 if (strpos(lower_title,"chairman")    > 0 ///
+                        |  strpos(lower_title,"chairwoman")  > 0 ///
+                        |  strpos(lower_title,"chairperson") > 0) ///
+                        & strpos(lower_title,"president") > 0
+
+* [DISCUSS] A missing TITLE gives lower_title == "", strpos() == 0, hence
+* powerindex == 0. "No title information" is therefore coded as "no power".
+* Quantify it for the PDF:
+count if missing(TITLE)
+tab powerindex, missing
+* Sanity-check the string matching before trusting it:
+tab TITLE if powerindex == 2, sort
+
+*--- 3.2) rename the remaining variables ------------------------------------------
+rename CEOANN                  ceoann
+rename YEAR                    year
+rename SHROWN_EXCL_OPTS_PCT    sharesowned      // % of shares owned, excl. options
+rename BECAMECEO               becameceo
+rename OPTION_AWARDS_BLK_VALUE optionsvalue     // Black-Scholes value, $ thousands
+rename GVKEY                   gvkey
+destring gvkey, replace                          // same type as the other file
+
+*--- 3.3) keep CEOs only ------------------------------------------------------------
 keep if ceoann == "CEO"
 
-* --- 1.2 make gvkey a clean, CONSISTENT type ------------------------------------
-* This is the single most common source of failed merges. Pick ONE convention
-* and use it in every dataset in this do file. Here: numeric.
-capture confirm string variable gvkey
-if !_rc destring gvkey, replace
-destring year, replace force          // no-op if already numeric
+*--- 3.4) CEO tenure ---------------------------------------------------------------
+gen tenure_ceo  = year - year(becameceo)
+replace tenure_ceo = . if year - year(becameceo) < 0     // data errors
+gen tenure_ceo2 = tenure_ceo^2
 
-* --- 1.3 the panel must be unique at gvkey-year ---------------------------------
-duplicates report gvkey year
-duplicates list   gvkey year          // INSPECT before dropping (workshop Ex.5)
-* Duplicates arise when Execucomp flags two CEOs in one fiscal year (turnover).
-* Decide and DOCUMENT your rule, e.g. keep the one with the higher TDC1:
-bysort gvkey year (tdc1): keep if _n == _N
-isid gvkey year                       // hard stop if still not unique
+*--- 3.5) ownership and option grants ------------------------------------------------
+gen sharesowned2 = sharesowned^2
 
-* --- 1.4 dependent variable -----------------------------------------------------
-* TDC1 = total compensation (salary + bonus + other annual + LTIP + option grants)
-drop if missing(tdc1) | tdc1 <= 0     // log is undefined otherwise
-gen double LnTDC = log(tdc1)
-label variable LnTDC "Ln(CEO total compensation, TDC1)"
+*--- 3.6) dependent variable ----------------------------------------------------------
+gen ln_tdc = log(TDC1)
+label variable ln_tdc "Ln(CEO total compensation, TDC1)"
 
-* --- 1.5 CEO tenure  (from BECAMECEO) -------------------------------------------
-* BECAMECEO is a daily date in the .dta. If WRDS gave you a string, convert first.
-capture confirm string variable becameceo
-if !_rc {
-    gen becameceo_d = date(becameceo, "YMD")          // check the actual format!
-    format becameceo_d %td
-    drop becameceo
-    rename becameceo_d becameceo
-}
-gen ceo_start_year = year(becameceo)
-gen Tenure         = year - ceo_start_year
-replace Tenure = .  if Tenure < 0                      // data errors
-gen Tenure_squared = Tenure^2
-label variable Tenure         "Years since becoming CEO"
-label variable Tenure_squared "Tenure squared"
-
-* --- 1.6 CEO ownership ----------------------------------------------------------
-* SHROWN_EXCL_OPTS_PCT = % of total shares owned, excluding options.
-rename shrown_excl_opts_pct Sharesowned
-gen Sharesowned_squared = Sharesowned^2
-label variable Sharesowned         "% of shares owned, excl. options"
-label variable Sharesowned_squared "Shares owned squared"
-
-* --- 1.7 value of option grants --------------------------------------------------
-rename option_awards_blk_value Optionsvalue
-label variable Optionsvalue "Black-Scholes value of options granted ($000)"
-* NOTE ON UNITS: Execucomp reports this in $thousands. Whatever scaling you use
-* (raw, /1000, or /tdc1), state it in the PDF -- it drives the coefficient size.
-
-* --- 1.8 title-based power components (from TITLE) --------------------------------
-gen title_l = lower(title)                              // workshop Ex.12: lower()
-gen byte d_chairman  = (strpos(title_l, "chairman") > 0 | strpos(title_l, "chmn") > 0)
-gen byte d_president = (strpos(title_l, "pres") > 0)
-gen byte d_founder   = (strpos(title_l, "founder") > 0)
-replace d_chairman  = . if missing(title)
-replace d_president = . if missing(title)
-replace d_founder   = . if missing(title)
-* SANITY CHECK the string matching before you trust it:
-tab title if d_chairman == 1, sort
-tab title if d_chairman == 0 & d_president == 0, sort
-
-keep gvkey year execid co_per_rol exec_fullname LnTDC tdc1 ///
-     Tenure Tenure_squared Sharesowned Sharesowned_squared Optionsvalue ///
-     d_chairman d_president d_founder
-compress
-save "temp/exec_clean.dta", replace
-
-
-*===============================================================================
-* 2. CLEAN THE PERFORMANCE FILE  (execucomp_perforamance.dta)
-*    Level = firm-year.
-*===============================================================================
-use "data/execucomp_perforamance.dta", clear
-describe
-
-capture confirm string variable gvkey
-if !_rc destring gvkey, replace
-destring year, replace force
-
-duplicates report gvkey year
-duplicates drop  gvkey year, force
+* [SUBMISSION FIX] merge 1:1 aborts on duplicates, so assert uniqueness here and
+* get a clear error instead of a cryptic one:
 isid gvkey year
 
-* --- 2.1 firm size ----------------------------------------------------------------
-drop if missing(assets) | assets <= 0
-gen double LnAsset = log(assets)
-label variable LnAsset "Ln(total assets)"
-
-* --- 2.2 stock return volatility ---------------------------------------------------
-rename bs_volatility Volatility
-label variable Volatility "60-month Black-Scholes volatility"
-
-* --- 2.3 ANNUAL STOCK RETURN -- this is why AJEX was on the download list ----------
-* PRCCF is the raw fiscal-year-end close price; it jumps on splits.
-* AJEX is the cumulative adjustment factor. PRCCF/AJEX is the split-adjusted price.
-xtset gvkey year
-gen double prc_adj = prccf / ajex
-gen double Rstock  = prc_adj / L.prc_adj - 1
-label variable Rstock "Fiscal-year stock return (split-adjusted, ex-dividend)"
-* CAVEAT to state in the PDF: this is a price return; it excludes dividends,
-* because the instruction did not ask you to download TRS1YR.
-
-* --- 2.4 industry code -------------------------------------------------------------
-* SIC is on the download list for a reason -- see Section 4.2 and 5.
-capture confirm string variable sic
-if _rc {
-    tostring sic, gen(sic_str) format(%04.0f)
-}
-else {
-    gen sic_str = sic
-}
-gen num_digits_sic = strlen(sic_str)          // workshop Ex.12
-tab num_digits_sic
-gen sic2 = substr(sic_str, 1, 2)
-destring sic2, replace
-label variable sic2 "2-digit SIC industry"
-
-keep gvkey year LnAsset assets Volatility Rstock roa sic sic2 prccf ajex
-compress
-save "temp/perf_clean.dta", replace
-
 
 *===============================================================================
-* 3. MERGE  (instruction: merge on gvkey and year)
+* 4) MERGE  (instruction: on gvkey and year)
 *===============================================================================
-use "temp/exec_clean.dta", clear
-merge 1:1 gvkey year using "temp/perf_clean.dta"
-
-tab _merge                    // report these counts in the PDF
-keep if _merge == 3           // workshop Ex.19
+merge 1:1 gvkey year using "data/execucomp_perforamance1.dta"
+tab _merge                    // report these three counts in the PDF
+keep if _merge == 3           // [SUBMISSION FIX] the official solution only drops _merge
 drop _merge
 
-xtset gvkey year
-
 
 *===============================================================================
-* 4. CONSTRUCT THE ANALYSIS VARIABLES
+* 5) REGRESSIONS
 *===============================================================================
+global CONTROLS LnAsset Volatility sharesowned sharesowned2 optionsvalue ///
+                tenure_ceo tenure_ceo2
+
+*--- Column (1): LEVEL EFFECT -- Morse et al. Table II, column (1) -----------------
+reghdfe ln_tdc powerindex zROA zRstock lag_zROA lag_zRstock $CONTROLS, ///
+        absorb(gvkey year) vce(robust)
+
+outreg2 using "results/table1", excel replace ///
+        ctitle(Table II column (1)) nocons dec(3) ///
+        addtext(Firm FE, YES, Year FE, YES)
+
+*--- MAX: the value of the more favourable performance measure ---------------------
+* max = max(zROA, zRstock). It is CONTINUOUS, not an indicator.
+* Missing propagates correctly: Stata treats missing as +infinity, so if either
+* input is missing exactly one of the two replaces fires and assigns a missing.
+gen max = 0
+replace max = zROA    if zROA >  zRstock
+replace max = zRstock if zROA <= zRstock
+label variable max "max(zROA, zRstock)"
+
+gen interaction = powerindex*max
+label variable interaction "PowerIndex x Max"
+
+*--- Column (2): RIGGING EFFECT -- Morse et al. Table III, column (3) --------------
+* Same controls as column (1). N is automatically identical across the two
+* columns: interaction is missing exactly when max is missing, i.e. when zROA or
+* zRstock is missing -- and both are already regressors in column (1).
+* [DISCUSS] There is no main effect of max in the specification, only the
+* interaction, while max is a nonlinear function of zROA and zRstock, which are
+* in the model. The interaction coefficient may absorb part of that level effect.
+reghdfe ln_tdc powerindex interaction zROA zRstock lag_zROA lag_zRstock $CONTROLS, ///
+        absorb(gvkey year) vce(robust)
+
+outreg2 using "results/table1", excel append ///
+        ctitle(Table III column (3)) nocons dec(3) ///
+        addtext(Firm FE, YES, Year FE, YES)
+
+* [DISCUSS] vce(robust), not clustered by firm. Clustering on gvkey is the usual
+* choice for a firm-year panel; the official solution does not do it.
+* [DISCUSS] No winsorising anywhere. ROA and Rstock have extreme values in Execucomp.
 
 *-------------------------------------------------------------------------------
-* 4.1 Winsorize continuous variables at 1% / 99%   (workshop Ex.9)
+* [SUBMISSION FIX] "containing ONLY those variables and data needed to estimate
+* the regressions" -- the official solution saves every column from both files.
 *-------------------------------------------------------------------------------
-winsor2 roa Rstock LnAsset Volatility Sharesowned Optionsvalue Tenure, ///
-        cuts(1 99) replace
-* Re-build the squared terms AFTER winsorizing the levels:
-replace Sharesowned_squared = Sharesowned^2
-replace Tenure_squared      = Tenure^2
-
-*-------------------------------------------------------------------------------
-* 4.2 zROA and zRstock  --  standardised performance measures
-*
-* >>> THE SINGLE MOST CONSEQUENTIAL CHOICE IN THIS ASSIGNMENT <<<
-* The two measures must be on a COMMON scale, otherwise "which measure looks
-* better this year" (the Max variable) is meaningless. Read the notes to
-* Table II / Table III in Morse et al. (2011) and pick ONE benchmark group,
-* then state it in the PDF. Three defensible variants, coded below:
-*   A) by year                 -- "relative to all firms this year"
-*   B) by sic2-year            -- "relative to industry peers this year"
-*   C) by firm (over time)     -- "relative to the firm's own history"
-*-------------------------------------------------------------------------------
-
-* ---- VARIANT A: by year (uncomment the variant you choose) --------------------
-bysort year: egen double m_roa = mean(roa)
-bysort year: egen double s_roa = sd(roa)
-gen double zROA = (roa - m_roa) / s_roa
-
-bysort year: egen double m_rst = mean(Rstock)
-bysort year: egen double s_rst = sd(Rstock)
-gen double zRstock = (Rstock - m_rst) / s_rst
-
-/*  ---- VARIANT B: by industry-year (workshop Ex.13: bysort ... : egen) --------
-bysort sic2 year: egen double m_roa = mean(roa)
-bysort sic2 year: egen double s_roa = sd(roa)
-gen double zROA = (roa - m_roa) / s_roa
-bysort sic2 year: egen double m_rst = mean(Rstock)
-bysort sic2 year: egen double s_rst = sd(Rstock)
-gen double zRstock = (Rstock - m_rst) / s_rst
-*/
-
-/*  ---- VARIANT C: by firm over time -------------------------------------------
-bysort gvkey: egen double m_roa = mean(roa)
-bysort gvkey: egen double s_roa = sd(roa)
-gen double zROA = (roa - m_roa) / s_roa
-bysort gvkey: egen double m_rst = mean(Rstock)
-bysort gvkey: egen double s_rst = sd(Rstock)
-gen double zRstock = (Rstock - m_rst) / s_rst
-*/
-
-drop m_roa s_roa m_rst s_rst
-label variable zROA     "Standardised ROA"
-label variable zRstock  "Standardised stock return"
-
-* --- lagged performance (workshop Ex.15: L. operator; requires xtset) -----------
-xtset gvkey year
-gen double lag_zROA    = L.zROA
-gen double lag_zRstock = L.zRstock
-label variable lag_zROA    "Lagged standardised ROA"
-label variable lag_zRstock "Lagged standardised stock return"
-
-*-------------------------------------------------------------------------------
-* 4.3 Max -- the "more favourable" performance measure
-*     = 1 when the standardised stock return looks better than standardised ROA
-*-------------------------------------------------------------------------------
-gen byte Max = (zRstock > zROA) if !missing(zRstock, zROA)
-label variable Max "1 if zRstock > zROA (more favourable measure)"
-tab Max                       // should be roughly 50/50; if not, re-check 4.2
-
-*-------------------------------------------------------------------------------
-* 4.4 PowerIndex
-*
-* >>> VERIFY THE COMPONENT LIST against the Data section of Morse et al. (2011).
-* The four candidates below are exactly what the downloaded variables allow
-* (TITLE -> chairman/president; BECAMECEO -> tenure; SHROWN_EXCL_OPTS_PCT ->
-* ownership). Adjust the list, and the cut-offs, to match the paper.
-*-------------------------------------------------------------------------------
-bysort year: egen double p50_tenure = median(Tenure)
-bysort year: egen double p50_own    = median(Sharesowned)
-
-gen byte d_tenure_high = (Tenure      > p50_tenure) if !missing(Tenure)
-gen byte d_own_high    = (Sharesowned > p50_own)    if !missing(Sharesowned)
-
-egen byte PowerIndex = rowtotal(d_chairman d_president d_tenure_high d_own_high)
-replace  PowerIndex = . if missing(d_chairman, d_president, d_tenure_high, d_own_high)
-label variable PowerIndex "CEO power index (0-4)"
-tab PowerIndex, missing        // report this distribution in the PDF
-
-drop p50_tenure p50_own
-
-* --- the interaction term -------------------------------------------------------
-gen double MaxPowerIndex = Max * PowerIndex
-label variable MaxPowerIndex "Max x PowerIndex"
-
-* --- numeric firm id for the fixed effects ---------------------------------------
-egen long firm_id = group(gvkey)
-
-
-*===============================================================================
-* 5. SAMPLE SCREENS
-*===============================================================================
-keep if inrange(year, 1992, 2005)
-
-* Financials (SIC 6000-6999) and utilities (SIC 4900-4949) are routinely excluded
-* in the executive-pay literature because their accounting and regulation differ.
-* CHECK whether Morse et al. (2011) do this; if yes, uncomment:
-* drop if inrange(sic, 6000, 6999)
-* drop if inrange(sic, 4900, 4949)
-
-* Listwise deletion so BOTH columns run on an identical sample:
-egen byte nmiss = rowmiss(LnTDC PowerIndex zROA zRstock lag_zROA lag_zRstock ///
-                          LnAsset Volatility Sharesowned Sharesowned_squared ///
-                          Optionsvalue Tenure Tenure_squared Max)
-keep if nmiss == 0
-drop nmiss
-
-unique gvkey                    // number of firms
-unique gvkey year               // should equal _N
-count                           // target order of magnitude: ~8,000 obs
-
-* --- descriptive statistics for the PDF (workshop Ex.7) ---------------------------
-tabstat LnTDC PowerIndex Max zROA zRstock lag_zROA lag_zRstock LnAsset ///
-        Volatility Sharesowned Optionsvalue Tenure, ///
-        stat(N mean sd min p25 median p75 max) columns(statistics)
-
-
-*===============================================================================
-* 6. REGRESSIONS  (workshop Ex.17 / Ex.18)
-*===============================================================================
-global CONTROLS LnAsset Volatility Sharesowned Sharesowned_squared ///
-                Optionsvalue Tenure Tenure_squared
-
-* --- Column (1): LEVEL EFFECT  = Morse et al. Table II, column (1) ---------------
-reghdfe LnTDC PowerIndex zROA zRstock lag_zROA lag_zRstock $CONTROLS, ///
-        absorb(firm_id year) vce(cluster firm_id)
-estimates store col1
-gen byte esample = e(sample)       // lock the sample so column (2) matches N
-
-outreg2 using "result/table_main.rtf", replace word ///
-    label nocons se bdec(3) sdec(3) ///
-    addstat("R-squared", e(r2)) ///
-    addtext("Firm FE", "YES", "Year FE", "YES") ///
-    ctitle("Table II column (1)") ///
-    title("Table 1. CEO power and CEO compensation, Execucomp 1992-2005")
-
-* --- Column (2): RIGGING EFFECT = Morse et al. Table III, column (3) -------------
-* NOTE: equation (2) in the instruction contains X'b, but the template table
-* leaves the control rows blank in column (2). Decide, run it, and flag the
-* discrepancy in the "issues for the grader" section of the PDF.
-reghdfe LnTDC PowerIndex MaxPowerIndex zROA zRstock lag_zROA lag_zRstock ///
-        $CONTROLS if esample, ///
-        absorb(firm_id year) vce(cluster firm_id)
-estimates store col2
-
-outreg2 using "result/table_main.rtf", append word ///
-    label nocons se bdec(3) sdec(3) ///
-    addstat("R-squared", e(r2)) ///
-    addtext("Firm FE", "YES", "Year FE", "YES") ///
-    ctitle("Table III column (3)")
-
-* Variant to consider and document: include the main effect of Max as well.
-* reghdfe LnTDC PowerIndex Max MaxPowerIndex zROA zRstock lag_zROA lag_zRstock ///
-*         $CONTROLS if esample, absorb(firm_id year) vce(cluster firm_id)
-
-
-*===============================================================================
-* 7. SAVE execucomp_morse.dta
-*    "containing ONLY those variables and data needed to estimate the regressions"
-*===============================================================================
-keep gvkey year firm_id LnTDC PowerIndex Max MaxPowerIndex ///
+keep gvkey year ln_tdc powerindex max interaction ///
      zROA zRstock lag_zROA lag_zRstock $CONTROLS
-order gvkey year firm_id LnTDC PowerIndex Max MaxPowerIndex ///
+order gvkey year ln_tdc powerindex max interaction ///
       zROA zRstock lag_zROA lag_zRstock
 compress
 save "data/execucomp_morse.dta", replace
+clear all
 
 
 *===============================================================================
-* 8. EXTENSION: firm-level climate change exposure (Sautner et al. 2023)
+* 6) EXTENSION: firm-level climate change exposure
+*    Source file: firmyear_score_2021Q4_Version_2022_Nov_22.csv from https://osf.io/fd6jq/
 *===============================================================================
-
-* --- 8.1 import the OSF file ------------------------------------------------------
-import delimited "data/firmyear_score_2021Q4_Version_2022_Nov_22.csv", ///
-       clear varnames(1) case(lower)
-describe
+import delimited "data/climatechage_exposure.csv", clear
 
 keep gvkey year cc_expo_ew
-
-* gvkey MUST end up the same type as in execucomp_morse.dta (numeric here):
-capture confirm string variable gvkey
-if !_rc destring gvkey, replace force
-destring year cc_expo_ew, replace force
+destring gvkey year cc_expo_ew, replace force   // gvkey must match the .dta type
 drop if missing(gvkey, year)
-
-duplicates report gvkey year
-duplicates drop  gvkey year, force
+duplicates drop gvkey year, force
 isid gvkey year
 
-rename cc_expo_ew ClimateChange_Exposure
-label variable ClimateChange_Exposure "Firm-level climate change exposure (cc_expo_ew)"
-save "temp/climate_clean.dta", replace
-
-* --- 8.2 merge onto the replication sample -----------------------------------------
-use "data/execucomp_morse.dta", clear
-merge 1:1 gvkey year using "temp/climate_clean.dta"
+merge 1:1 gvkey year using "data/execucomp_morse.dta"
 tab _merge
-keep if _merge == 3
+keep if _merge == 3                              // [SUBMISSION FIX]
 drop _merge
-* Coverage note for the PDF: the OSF data start in 2002 and the Execucomp sample
-* ends in 2005, so the extension sample is effectively 2002-2005 only.
+
+* Coverage note for the PDF: the OSF data start in 2002 and Execucomp ends in
+* 2005, so the extension sample is effectively 2002-2005 only.
 tab year
 
-* --- 8.3 re-run the rigging regression with the new regressor ----------------------
-xtset firm_id year
-reghdfe LnTDC ClimateChange_Exposure PowerIndex MaxPowerIndex ///
-        zROA zRstock lag_zROA lag_zRstock $CONTROLS, ///
-        absorb(firm_id year) vce(cluster firm_id)
-estimates store col3
+reghdfe ln_tdc cc_expo_ew powerindex interaction zROA zRstock lag_zROA lag_zRstock ///
+        $CONTROLS, absorb(gvkey year) vce(robust)
 
-outreg2 using "result/table_extension.rtf", replace word ///
-    label nocons se bdec(3) sdec(3) ///
-    addstat("R-squared", e(r2)) ///
-    addtext("Firm FE", "YES", "Year FE", "YES") ///
-    ctitle("Extension Exercise") ///
-    title("Table 2. Climate change exposure and CEO compensation")
+outreg2 using "results/table2", excel replace ///
+        ctitle(Extension Exercise) nocons dec(3) ///
+        addtext(Firm FE, YES, Year FE, YES)
 
-* --- 8.4 save ------------------------------------------------------------------------
 compress
 save "data/extension_exercise.dta", replace
-
-log close
+clear all
 
 *===============================================================================
-* END OF DO FILE
+* End
 *===============================================================================
