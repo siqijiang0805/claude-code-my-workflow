@@ -60,6 +60,19 @@ print(os.listdir("data"))
 #     系数带星号、标准误在括号里、底部附 N / R² / FE 行，导出成 Excel。
 # =============================================================================
 
+def stata_log(x):
+    """复刻 Stata 的 log()：x <= 0 返回缺失。
+    numpy 不一样：log(0) 给 -inf、log(负数) 给 nan。-inf 会污染回归，
+    并让 to_stata 直接报 ValueError。"""
+    x = pd.to_numeric(x, errors="coerce")
+    return np.log(x.where(x > 0))
+
+
+def no_inf(s):
+    """复刻 Stata 的除法：分母为 0 时结果是缺失，而不是 ±inf。"""
+    return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+
 def stata_lag(df, cols, by="gvkey", t="year", n=1):
     """复刻 Stata 的 l. 算子：按 (by, t-n) 取值，该年份不存在就是缺失。"""
     lag = df[[by, t] + cols].copy()
@@ -154,11 +167,13 @@ perf = perf.sort_values(["gvkey", "year"]).reset_index(drop=True)
 # 这里必须用上面的 stata_lag()，不能用 .shift(1)。
 # （这是价格收益率，不含股息——因为作业没让下 TRS1YR。）
 # =============================================================================
-perf["LnAsset"] = np.log(perf["assets"])
+perf["LnAsset"] = stata_log(perf["assets"])      # Stata 的 log(0) 是缺失，不是 -inf
 perf = perf.rename(columns={"bs_volatility": "Volatility"})
 
 perf = stata_lag(perf, ["prccf", "ajex"])                 # 生成 l1_prccf, l1_ajex
-perf["Rstock"] = (perf["prccf"] / perf["ajex"]) / (perf["l1_prccf"] / perf["l1_ajex"]) - 1
+perf["Rstock"] = no_inf(                          # Stata 的 x/0 是缺失，不是 inf
+    (perf["prccf"] / perf["ajex"]) / (perf["l1_prccf"] / perf["l1_ajex"]) - 1
+)
 
 
 # %% =========================================================================
@@ -196,8 +211,8 @@ perf["std_sic2_year_ROA"]     = g["ROA"].transform("std")
 perf["mean_sic2_year_Rstock"] = g["Rstock"].transform("mean")
 perf["std_sic2_year_Rstock"]  = g["Rstock"].transform("std")
 
-perf["zROA"]    = (perf["ROA"]    - perf["mean_sic2_year_ROA"])    / perf["std_sic2_year_ROA"]
-perf["zRstock"] = (perf["Rstock"] - perf["mean_sic2_year_Rstock"]) / perf["std_sic2_year_Rstock"]
+perf["zROA"]    = no_inf((perf["ROA"]    - perf["mean_sic2_year_ROA"])    / perf["std_sic2_year_ROA"])
+perf["zRstock"] = no_inf((perf["Rstock"] - perf["mean_sic2_year_Rstock"]) / perf["std_sic2_year_Rstock"])
 
 
 # %% =========================================================================
@@ -326,7 +341,7 @@ exe["tenure_ceo2"] = exe["tenure_ceo"] ** 2
 # 原始单位，do 文件没有做任何缩放，这里也不做。
 # =============================================================================
 exe["sharesowned2"] = exe["sharesowned"] ** 2
-exe["ln_tdc"]       = np.log(exe["TDC1"])
+exe["ln_tdc"]       = stata_log(exe["TDC1"])      # 同 LnAsset
 
 
 # %% =========================================================================

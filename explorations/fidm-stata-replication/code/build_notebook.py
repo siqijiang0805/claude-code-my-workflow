@@ -23,6 +23,7 @@ md(r"""
 | `replace max = zROA if zROA > zRstock` | Stata 把 missing 当 **+∞**；pandas 里 NaN 比较一律 False | `.max(axis=1, skipna=False)` |
 | `merge 1:1` | Stata 默认保留 `_merge` 三类全部；pandas 默认 inner | `how="outer"` |
 | `tostring sic` 后缺失变空串 | 空串在 Stata 里是一个**有效分组**；pandas `groupby` 默认丢弃 NaN | 把缺失填成 `""` 再分组 |
+| `log(assets)`、`x/0` | Stata 给**缺失**；numpy 给 `-inf` / `inf`，会一路污染回归并让 `to_stata` 报错 | `stata_log()` / `no_inf()` |
 
 `reghdfe ..., absorb() vce(robust)` 的对应物是 `pyfixest.feols("y ~ x | fe1 + fe2", vcov="hetero")`。
 """)
@@ -78,8 +79,12 @@ md(r"""## §0-c　四个工具函数
 
 1. **`norm_cols()`** — 大小写不敏感地改名。WRDS 的 CSV 列名有时全大写有时全小写，写死一种会 KeyError。
 2. **`stata_lag()`** — 复刻 Stata 的 `l.` 滞后算子。`l.x` 是"同一个 gvkey 在 `year-1` 那一年的 x"，某公司缺 1995 年时 1996 年的 `l.x` 就是缺失；`.shift(1)` 是"上一行"，会跨年错取。
-3. **`outreg2_like()`** — 复刻 `outreg2` 的输出：系数带星号、标准误在括号里、底部 N / R² / FE 行、导出 Excel。
-4. **`to_dta()`** — `to_stata()` 的包装，自动处理日期列和可空类型，避免常见报错。
+3. **`stata_log()`** — 复刻 Stata 的 `log()`：`x <= 0` 返回**缺失**。
+   numpy 不一样：`np.log(0) = -inf`、`np.log(负数) = nan`。
+   `-inf` 会一路带进回归污染系数，`to_stata` 也会直接 `ValueError`。
+4. **`no_inf()`** — 复刻 Stata 的除法：分母为 0 时结果是**缺失**，不是 `±inf`。
+5. **`outreg2_like()`** — 复刻 `outreg2` 的输出：系数带星号、标准误在括号里、底部 N / R² / FE 行、导出 Excel。
+6. **`to_dta()`** — `to_stata()` 的包装，处理日期列、可空类型、残留的 `±inf` 和不合法的变量名。
 """)
 code(r'''
 def norm_cols(df, mapping):
@@ -93,6 +98,19 @@ def need(df, cols, who):
     """缺列就立刻报错，别等到十几段之后才炸。"""
     miss = [c for c in cols if c not in df.columns]
     assert not miss, f"{who} 缺少这些列：{miss}\n实际列名：{df.columns.tolist()}"
+
+
+def stata_log(x):
+    """复刻 Stata 的 log()：x <= 0 返回缺失。
+    numpy 不一样：np.log(0) = -inf，np.log(负数) = nan 并抛 RuntimeWarning。
+    -inf 会一路带进回归污染系数，to_stata 也会直接报 ValueError。"""
+    x = pd.to_numeric(x, errors="coerce")
+    return np.log(x.where(x > 0))
+
+
+def no_inf(s):
+    """复刻 Stata 的除法：分母为 0 时结果是缺失，而不是 ±inf。"""
+    return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan)
 
 
 def stata_lag(df, cols, by="gvkey", t="year", n=1):
@@ -138,8 +156,10 @@ def outreg2_like(models, ctitles, path):
 
 
 def to_dta(df, path):
-    """to_stata 的包装：日期列走 convert_dates，可空类型转成 Stata 认得的类型。"""
+    """to_stata 的包装：处理日期列、可空类型、残留 ±inf、不合法的变量名。"""
+    import re as _re
     out = df.copy()
+
     convert_dates = {}
     for c in out.columns:
         s = out[c]
@@ -149,6 +169,33 @@ def to_dta(df, path):
             out[c] = s.astype(object).where(s.notna(), "")
         elif str(s.dtype) in ("Int64", "Int32", "Int16", "Int8", "Float64", "boolean"):
             out[c] = s.astype("float64")
+
+    # 最后一道保险：Stata 不接受 ±inf（这些运算在 Stata 里本来就该是缺失）
+    for c in out.columns:
+        if pd.api.types.is_float_dtype(out[c]):
+            m = np.isinf(out[c].to_numpy())
+            if m.any():
+                print(f"  ⚠ {c}: {m.sum()} 个 ±inf 已转成缺失（去上游查一下为什么）")
+                out[c] = out[c].replace([np.inf, -np.inf], np.nan)
+
+    # Stata 变量名规则：≤32 字符、只能字母数字下划线、不能数字开头
+    ren, seen = {}, set()
+    for c in out.columns:
+        n = _re.sub(r"\W", "_", str(c))[:32]
+        if not n or n[0].isdigit():
+            n = ("v" + n)[:32]
+        base, k = n, 1
+        while n in seen:
+            k += 1
+            n = f"{base[:29]}_{k}"
+        seen.add(n)
+        if n != c:
+            ren[c] = n
+    if ren:
+        print("  变量名已调整:", ren)
+    out = out.rename(columns=ren)
+    convert_dates = {ren.get(k, k): v for k, v in convert_dates.items()}
+
     out.to_stata(path, write_index=False, version=117, convert_dates=convert_dates)
     print("saved:", path, out.shape)
 ''')
@@ -240,14 +287,24 @@ gen Rstock = (prccf/ajex)/(l.prccf/l.ajex) - 1
 （这是价格收益率，**不含股息** —— 因为作业没让下 `TRS1YR`。这点要写进 PDF 的变量定义。）
 """)
 code(r'''
-perf["LnAsset"] = np.log(perf["assets"])
+perf["assets"] = pd.to_numeric(perf["assets"], errors="coerce")
+print("assets <= 0 的行数:", (perf["assets"] <= 0).sum(), "  <- 这些行 LnAsset 会是缺失")
+
+perf["LnAsset"] = stata_log(perf["assets"])        # Stata 的 log(0) 是缺失，不是 -inf
 perf = perf.rename(columns={"bs_volatility": "Volatility"})
 
+for c in ["prccf", "ajex"]:
+    perf[c] = pd.to_numeric(perf[c], errors="coerce")
+
 perf = stata_lag(perf, ["prccf", "ajex"])          # 生成 l1_prccf, l1_ajex
-perf["Rstock"] = (perf["prccf"] / perf["ajex"]) / (perf["l1_prccf"] / perf["l1_ajex"]) - 1
+perf["Rstock"] = no_inf(                           # Stata 的 x/0 是缺失，不是 inf
+    (perf["prccf"] / perf["ajex"]) / (perf["l1_prccf"] / perf["l1_ajex"]) - 1
+)
 
 print(perf[["gvkey", "year", "prccf", "ajex", "l1_prccf", "l1_ajex", "Rstock"]].head(8))
-print("\nRstock 非缺失数:", perf["Rstock"].notna().sum())
+print("\nLnAsset 非缺失数:", perf["LnAsset"].notna().sum(),
+      "| Rstock 非缺失数:", perf["Rstock"].notna().sum())
+assert not np.isinf(perf[["LnAsset", "Rstock"]].to_numpy(dtype="float64")).any()
 ''')
 
 # ----------------------------------------------------------------- 2.3b
@@ -302,6 +359,8 @@ gen zROA = (ROA - mean_sic2_year_ROA) / std_sic2_year_ROA
 `dropna=False` 是为了让 §2.3-b 里那些 `sic2 == ""` 的行也参与分组（同 Stata）。
 """)
 code(r'''
+perf["ROA"] = pd.to_numeric(perf["ROA"], errors="coerce")
+
 g = perf.groupby(["sic2", "year"], dropna=False)
 
 perf["mean_sic2_year_ROA"]    = g["ROA"].transform("mean")
@@ -309,8 +368,9 @@ perf["std_sic2_year_ROA"]     = g["ROA"].transform("std")
 perf["mean_sic2_year_Rstock"] = g["Rstock"].transform("mean")
 perf["std_sic2_year_Rstock"]  = g["Rstock"].transform("std")
 
-perf["zROA"]    = (perf["ROA"]    - perf["mean_sic2_year_ROA"])    / perf["std_sic2_year_ROA"]
-perf["zRstock"] = (perf["Rstock"] - perf["mean_sic2_year_Rstock"]) / perf["std_sic2_year_Rstock"]
+# no_inf：某个 sic2-year 组内标准差为 0 时，Stata 给缺失、numpy 给 inf
+perf["zROA"]    = no_inf((perf["ROA"]    - perf["mean_sic2_year_ROA"])    / perf["std_sic2_year_ROA"])
+perf["zRstock"] = no_inf((perf["Rstock"] - perf["mean_sic2_year_Rstock"]) / perf["std_sic2_year_Rstock"])
 
 print(perf[["zROA", "zRstock"]].describe())
 ''')
@@ -504,8 +564,10 @@ exe["sharesowned"]  = pd.to_numeric(exe["sharesowned"],  errors="coerce")
 exe["optionsvalue"] = pd.to_numeric(exe["optionsvalue"], errors="coerce")
 exe["TDC1"]         = pd.to_numeric(exe["TDC1"],         errors="coerce")
 
+print("TDC1 <= 0 的行数:", (exe["TDC1"] <= 0).sum(), "  <- 这些行 ln_tdc 会是缺失")
+
 exe["sharesowned2"] = exe["sharesowned"] ** 2
-exe["ln_tdc"]       = np.log(exe["TDC1"])
+exe["ln_tdc"]       = stata_log(exe["TDC1"])       # 同 LnAsset：log(0) 要是缺失
 
 print(exe[["TDC1", "ln_tdc", "sharesowned", "optionsvalue"]].describe())
 ''')
