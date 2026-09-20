@@ -650,6 +650,33 @@ print(df.loc[keep, "year"].value_counts().sort_index().to_string())
 print("\n最终样本公司数:", df.loc[keep, "gvkey"].nunique())
 ''')
 
+md(r"""## §4.6　覆盖率诊断（可选，不改变任何结果）
+
+§4.5 如果显示某个变量把样本砍掉一大块，用这一格判断它是**数据本身就缺**
+（那老师用 Stata 跑也会掉同样的行），还是**格式问题**
+（`to_numeric(errors="coerce")` 把某种写法全变成了 NaN，这种是可以修的）。
+
+怎么读：
+- **比例逐年不同**（早年低、后期高）→ Execucomp 的覆盖问题，无解，在 PDF 里说明即可
+- **各年都差不多且都很低** → 格式问题，去看那一列的原始取值：`exe["sharesowned"].head(20)`
+""")
+code(r'''
+print("exec (CEO only):", exe.shape, "| 年份", exe.year.min(), "-", exe.year.max(),
+      "| 公司数", exe.gvkey.nunique())
+print("perf           :", perf.shape, "| 年份", perf.year.min(), "-", perf.year.max(),
+      "| 公司数", perf.gvkey.nunique())
+print("共同 (gvkey,year) 对数:",
+      len(set(map(tuple, exe[["gvkey", "year"]].to_numpy())) &
+          set(map(tuple, perf[["gvkey", "year"]].to_numpy()))))
+
+print("\nsharesowned 按年份的非缺失比例（exec）：")
+print(exe.groupby("year")["sharesowned"].apply(lambda s: round(s.notna().mean(), 3)).to_string())
+
+print("\nassets 按年份的非缺失比例（perf）：")
+print(perf.groupby("year")["assets"].apply(lambda s: round(s.notna().mean(), 3)).to_string())
+print("assets <= 0 的行数:", (perf["assets"] <= 0).sum())
+''')
+
 md(r"""## §5-a　第 (1) 列：Level effect
 ### Morse et al. (2011) Table II column (1)
 
