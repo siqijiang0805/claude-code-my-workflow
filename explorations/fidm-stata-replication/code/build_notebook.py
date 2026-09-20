@@ -60,6 +60,10 @@ EXEC_FILE = "execucomp_executive.csv"
 PERF_FILE = "execucomp_perforamance.csv"
 CC_FILE   = "climatechage_exposure.csv"   # OSF 那个 firmyear_score_...csv 改名而来
 
+# 总资产用哪一列。官方答案用 Execucomp 的 ASSETS；如果你的下载里这一列覆盖率很低
+# （§2.1 会打印各列非缺失数），重下时多勾一个总资产字段，然后把列名填在这里。
+ASSET_COL = "assets"
+
 RESULTS = os.path.join(os.path.dirname(DATA), "results")
 os.makedirs(RESULTS, exist_ok=True)       # outreg2 不会自动建文件夹，Python 也不会
 
@@ -249,11 +253,14 @@ perf = norm_cols(perf, {
     "SIC":           "sic",
     "AJEX":          "ajex",
     "ROA":           "ROA",      # do 文件里保持大写
+    "AT":            "at",       # 重下时若多勾了 Compustat 的 Total Assets，会落到这里
 })
 
-need(perf, ["gvkey", "year", "assets", "prccf", "ajex",
+need(perf, ["gvkey", "year", ASSET_COL, "prccf", "ajex",
             "bs_volatility", "sic", "ROA"], "performance 文件")
-print(perf.columns.tolist())
+
+print("各列非缺失数（对比 ROA 和 ASSET_COL —— 能算 ROA 就一定有总资产）：")
+print(perf.notna().sum().sort_values(ascending=False).to_string())
 ''')
 
 # ----------------------------------------------------------------- 2.2
@@ -301,10 +308,11 @@ gen Rstock = (prccf/ajex)/(l.prccf/l.ajex) - 1
 （这是价格收益率，**不含股息** —— 因为作业没让下 `TRS1YR`。这点要写进 PDF 的变量定义。）
 """)
 code(r'''
-perf["assets"] = pd.to_numeric(perf["assets"], errors="coerce")
-print("assets <= 0 的行数:", (perf["assets"] <= 0).sum(), "  <- 这些行 LnAsset 会是缺失")
+perf[ASSET_COL] = pd.to_numeric(perf[ASSET_COL], errors="coerce")
+print(f"{ASSET_COL} 非缺失:", perf[ASSET_COL].notna().sum(),
+      f"| {ASSET_COL} <= 0:", (perf[ASSET_COL] <= 0).sum(), "  <- 这些行 LnAsset 会是缺失")
 
-perf["LnAsset"] = stata_log(perf["assets"])        # Stata 的 log(0) 是缺失，不是 -inf
+perf["LnAsset"] = stata_log(perf[ASSET_COL])       # Stata 的 log(0) 是缺失，不是 -inf
 perf = perf.rename(columns={"bs_volatility": "Volatility"})
 
 for c in ["prccf", "ajex"]:
@@ -648,6 +656,11 @@ for c in cnt.index:
 print("\n最终回归样本的年份分布：")
 print(df.loc[keep, "year"].value_counts().sort_index().to_string())
 print("\n最终样本公司数:", df.loc[keep, "gvkey"].nunique())
+
+# 假如总资产完全不缺，N 最多能到多少 —— 决定值不值得重下数据
+REG_noA = [c for c in REG if c != "LnAsset"]
+print("\n不要求 LnAsset 时的样本上限:", df[REG_noA].notna().all(axis=1).sum(),
+      "  (接近 8,263 → 缺口就是 ASSETS 造成的，值得重下)")
 ''')
 
 md(r"""## §4.6　覆盖率诊断（可选，不改变任何结果）
