@@ -64,6 +64,10 @@ CC_FILE   = "climatechage_exposure.csv"   # OSF 那个 firmyear_score_...csv 改
 # （§2.1 会打印各列非缺失数），重下时多勾一个总资产字段，然后把列名填在这里。
 ASSET_COL = "assets"
 
+# 路 B：从 Compustat Fundamentals Annual 单独下一个只含 AT 的文件时，填文件名并把
+# ASSET_COL 改成 "at"。留 None 则 §2.2-b 什么都不做。
+AT_FILE = None            # 例如 "compustat_at.csv"
+
 RESULTS = os.path.join(os.path.dirname(DATA), "results")
 os.makedirs(RESULTS, exist_ok=True)       # outreg2 不会自动建文件夹，Python 也不会
 
@@ -256,7 +260,7 @@ perf = norm_cols(perf, {
     "AT":            "at",       # 重下时若多勾了 Compustat 的 Total Assets，会落到这里
 })
 
-need(perf, ["gvkey", "year", ASSET_COL, "prccf", "ajex",
+need(perf, ["gvkey", "year", "prccf", "ajex",
             "bs_volatility", "sic", "ROA"], "performance 文件")
 
 print("各列非缺失数（对比 ROA 和 ASSET_COL —— 能算 ROA 就一定有总资产）：")
@@ -291,6 +295,38 @@ print(perf.shape)
 ''')
 
 # ----------------------------------------------------------------- 2.3a
+md(r"""## §2.2-b　（可选）从 Compustat Fundamentals Annual 接入 `AT`
+
+do 文件里没有这一段。只在 `AT_FILE` 非空时运行，用来替代 Execucomp 里填充率不足的 `ASSETS`。
+
+`LnAsset = log(总资产)` 的定义不变，只是总资产换了一个更完整的来源。
+Fundamentals Annual 的年份列叫 `fyear`；同一 `gvkey-fyear` 偶尔有多行（不同 `consol`/`datafmt`），
+这里保留 `AT` 最大的那行（合并报表口径）。
+""")
+code(r'''
+if AT_FILE:
+    at = pd.read_csv(p(AT_FILE))
+    at = norm_cols(at, {"GVKEY": "gvkey", "FYEAR": "year", "AT": "at"})
+    need(at, ["gvkey", "year", "at"], "Compustat AT 文件")
+    at = at[["gvkey", "year", "at"]].copy()
+
+    at["gvkey"] = pd.to_numeric(at["gvkey"], errors="coerce")
+    at["year"]  = pd.to_numeric(at["year"],  errors="coerce")
+    at["at"]    = pd.to_numeric(at["at"],    errors="coerce")
+    at = at.dropna(subset=["gvkey", "year"])
+    at[["gvkey", "year"]] = at[["gvkey", "year"]].astype("int64")
+
+    at = (at.sort_values("at", ascending=False, na_position="last")
+            .drop_duplicates(["gvkey", "year"], keep="first"))
+
+    perf = perf.merge(at, on=["gvkey", "year"], how="left", validate="1:1")
+    print("AT 非缺失:", perf["at"].notna().sum(),
+          "| ROA 非缺失:", perf["ROA"].notna().sum(),
+          "| 原 assets 非缺失:", perf["assets"].notna().sum())
+else:
+    print("AT_FILE 为空，跳过。")
+''')
+
 md(r"""## §2.3-a　公司层面控制变量
 
 对应：
@@ -308,6 +344,7 @@ gen Rstock = (prccf/ajex)/(l.prccf/l.ajex) - 1
 （这是价格收益率，**不含股息** —— 因为作业没让下 `TRS1YR`。这点要写进 PDF 的变量定义。）
 """)
 code(r'''
+need(perf, [ASSET_COL], "performance 文件（ASSET_COL）")
 perf[ASSET_COL] = pd.to_numeric(perf[ASSET_COL], errors="coerce")
 print(f"{ASSET_COL} 非缺失:", perf[ASSET_COL].notna().sum(),
       f"| {ASSET_COL} <= 0:", (perf[ASSET_COL] <= 0).sum(), "  <- 这些行 LnAsset 会是缺失")
