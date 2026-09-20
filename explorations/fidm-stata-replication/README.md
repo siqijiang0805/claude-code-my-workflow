@@ -18,6 +18,8 @@
 | `xtset` + `l.prccf` | `.shift(1)` 按**行位置**取上一行；某公司年份断档时会跨年错取 | 按 `(gvkey, year-1)` merge，见 `stata_lag()` |
 | `replace max = zROA if zROA > zRstock` | Stata 把 missing 当 **+∞**；pandas 里 NaN 比较一律 False | `.max(axis=1, skipna=False)` |
 | `merge 1:1` | Stata 默认保留 `_merge` 三类全部；pandas 默认 inner | `how="outer"` |
+| `tostring sic` 后缺失变空串 | 空串在 Stata 里是**有效分组**；pandas `groupby` 默认丢弃 NaN 键 | 填成 `""` + `dropna=False` |
+| `log(assets)`、`x/0` | Stata 给**缺失**；numpy 给 `-inf`/`inf`，会污染回归并让 `to_stata` 报 `ValueError` | `stata_log()` / `no_inf()` |
 
 另外 `reghdfe ..., absorb() vce(robust)` 的对应物是 `pyfixest.feols("y ~ x | fe1 + fe2", vcov="hetero")`。
 
