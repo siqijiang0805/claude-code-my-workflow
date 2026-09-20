@@ -5,7 +5,9 @@
 **代码：**
 - `code/official_solution.do` — 老师给的原版答案，不要改
 - `code/replication_fidm.do` — Stata 版，变量定义与官方答案一致，另补上作业要求但答案漏掉的几句
-- `code/replication_colab.py` — **Python / Google Colab 版**，与 `official_solution.do` 逐段一一对应，不多做任何一步
+- `code/replication_fidm_colab.ipynb` — **Google Colab notebook，直接上传就能跑**，与 `official_solution.do` 逐段一一对应
+- `code/replication_colab.py` — 同一份代码的纯脚本版（读 `.dta`）
+- `code/build_notebook.py` — 生成上面那个 ipynb 的脚本（改内容后重跑它）
 
 ### Python 版的三个语义陷阱
 
