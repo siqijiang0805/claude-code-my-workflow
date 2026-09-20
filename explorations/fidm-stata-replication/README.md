@@ -4,7 +4,20 @@
 **来源：** `Replication_Instruction_FIDM_2023_2024.docx`、`Stata_workshop_2023-2024.pptx`、`Morse_et_al_replication_2023_-_solution.do`
 **代码：**
 - `code/official_solution.do` — 老师给的原版答案，不要改
-- `code/replication_fidm.do` — 带注释的版本，变量定义与官方答案一致，另补上作业要求但答案漏掉的几句
+- `code/replication_fidm.do` — Stata 版，变量定义与官方答案一致，另补上作业要求但答案漏掉的几句
+- `code/replication_colab.py` — **Python / Google Colab 版**，与 `official_solution.do` 逐段一一对应，不多做任何一步
+
+### Python 版的三个语义陷阱
+
+直译成 pandas 会出错的地方（`replication_colab.py` 里已处理）：
+
+| solution.do | 直译的坑 | 正确做法 |
+|---|---|---|
+| `xtset` + `l.prccf` | `.shift(1)` 按**行位置**取上一行；某公司年份断档时会跨年错取 | 按 `(gvkey, year-1)` merge，见 `stata_lag()` |
+| `replace max = zROA if zROA > zRstock` | Stata 把 missing 当 **+∞**；pandas 里 NaN 比较一律 False | `.max(axis=1, skipna=False)` |
+| `merge 1:1` | Stata 默认保留 `_merge` 三类全部；pandas 默认 inner | `how="outer"` |
+
+另外 `reghdfe ..., absorb() vce(robust)` 的对应物是 `pyfixest.feols("y ~ x | fe1 + fe2", vcov="hetero")`。
 
 ---
 
